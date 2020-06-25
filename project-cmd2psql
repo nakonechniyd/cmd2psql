@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+cmd2psql --host {HOST} --port 5432 --username {USERNAME} --dbname {DBNAME} "$@"
