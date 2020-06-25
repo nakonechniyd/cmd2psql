@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+
+import subprocess
+import sys
+import os
+
+from typing import Tuple
+from typing import List
+from typing import Sequence
+
+from argparse import ArgumentParser
+from argparse import Namespace
+from itertools import chain
+
+
+# ensure a script runs with a minimal version 3.6 and higher
+assert sys.version_info >= (3, 6)
+
+
+if sys.version_info >= (3, 8):
+    from dataclasses import dataclass
+
+    @dataclass(frozen=True)
+    class Context:
+        host: str
+        port: str
+        username: str
+        dbname: str
+        instructions: str
+
+    @dataclass(frozen=True)
+    class Block:
+        commands: Tuple
+
+else:
+    from collections import namedtuple
+
+    Context = namedtuple(
+        'Context',
+        'host port username dbname instructions'.split(),
+    )
+    Block = namedtuple('Block', 'commands'.split())
+
+
+def parse_instructions(context: Context) -> Block:
+    instructions = context.instructions
+
+    commands = [
+        # TODO: doesn't work with some meta commands e.g. \d xxx
+        # # disable autocommit for "--single-transaction"
+        # '\\set AUTOCOMMIT off',
+        # '\\echo AUTOCOMMIT: :AUTOCOMMIT',
+    ]
+    current_db = None
+
+    for line in instructions.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("--"):
+            continue
+
+        command = []
+        if line.startswith('\\'):
+            # meta commands of psql
+
+            if line.startswith('\\c '):
+                # save current db
+                current_db = line.split()[1];
+        else:
+            # sql commands for postgres
+
+            # add empty line for vivid output
+            command.append('\\echo ')
+
+            # show sql command's database name
+            command.append(f"\\echo '\\\\c {current_db}'")
+
+        command.append(line)
+
+        if current_db is None:
+            # use default db when another doesn't set
+            current_db = context.dbname
+            commands.append(f'\\c {context.dbname}')
+
+        commands.extend(command)
+
+    return Block(commands=tuple(commands))
+
+
+def add_suffix(suffix: str, seq: Sequence) -> List:
+    return list(
+        chain(*([suffix, item] for item in seq))
+    )
+
+
+def execute_query(context: Context, block: Block) -> None:
+    cmd = [
+        line.encode('utf-8') for line in [
+            # postgres client
+            'psql',
+
+            # default options
+            '--no-psqlrc',
+            '--echo-queries',
+            '--no-password',
+
+            # TODO: doesn't work with some meta commands e.g. \d xxx
+            # '--single-transaction',
+
+            # connection string
+            '--host',
+            context.host,
+            '--port',
+            context.port,
+            '--username',
+            context.username,
+
+            # meta & sql commands
+            *add_suffix('-c', block.commands),
+        ]
+    ]
+
+    process = subprocess.Popen(
+        cmd,
+        stdin =subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    try:
+        stdout, stderr = process.communicate(timeout=60)
+    except subprocess.TimeoutExpired:
+        print('subprocess did not terminate in time')
+        exit(1)
+
+    stderr_msg = stderr.decode('utf-8').strip()
+    if stderr_msg:
+        print(stderr_msg)
+    else:
+        print()
+        print(stdout.decode('utf-8').strip())
+
+
+def get_context(params: Namespace) -> Context:
+    if sys.stdin.isatty():
+        instructions = params.instructions
+    else:
+        instructions = '\n'.join(sys.stdin.readlines())
+
+    return Context(
+        host=params.host,
+        port=params.port,
+        username=params.username,
+        dbname=params.dbname,
+        instructions=instructions,
+    )
+
+
+def get_cli_params() -> Namespace:
+    default_host = "local socket"
+    default_port = "5432"
+    default_user = os.environ.get('USER', 'postgres')
+
+    parser = ArgumentParser('util for postgesql execution', add_help=False)
+    parser.add_argument(
+        '-h',
+        '--host',
+        type=str,
+        help='database server host or socket directory '
+             f'(default: "{default_host}")',
+        default=default_host,
+    )
+    parser.add_argument(
+        '-p',
+        '--port',
+        type=str,
+        help=f'database server port (default: "{default_port}")',
+        default=default_port,
+    )
+    parser.add_argument(
+        '-U',
+        '--username',
+        type=str,
+        help=f'database user name (default: "{default_user}")',
+        default=default_user,
+    )
+    parser.add_argument(
+        '-d',
+        '--dbname',
+        type=str,
+        help=f'database name to connect to (default: "{default_user}")',
+        default=default_user,
+    )
+    parser.add_argument(
+        "-i",
+        "--instructions",
+        type=str,
+        help="sql instructions",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    params = get_cli_params()
+
+    context = get_context(params)
+    if not context.instructions:
+        print(
+            'sql instructions must be set by '
+            'parameter "instructions" or "stdin"'
+        )
+        exit(0)
+
+    block = parse_instructions(context)
+    execute_query(context, block)
+
+
+if __name__ == "__main__":
+    main()
