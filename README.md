@@ -7,6 +7,14 @@ passwords for databases should be placed in `.pgpass`
 ### install extention:
 - [Command Runner](https://marketplace.visualstudio.com/items?itemName=edonet.vscode-command-runner)
 
+
+### copy project-cmd2psql to your path:
+update values: HOST,USERNAME,DBNAME
+```
+cp project-cmd2psql $HOME/.local/bin
+```
+
+
 ### add these lines to settings.json:
 
 ```
