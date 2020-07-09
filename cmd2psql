@@ -45,14 +45,16 @@ else:
 def parse_instructions(context: Context) -> Block:
     instructions = context.instructions
 
+    current_db = None
     commands = [
         # TODO: doesn't work with some meta commands e.g. \d xxx
         # # disable autocommit for "--single-transaction"
         # '\\set AUTOCOMMIT off',
         # '\\echo AUTOCOMMIT: :AUTOCOMMIT',
     ]
-    current_db = None
 
+    variables = {}
+    expression = []
     for line in instructions.split("\n"):
         line = line.strip()
         if not line:
@@ -60,32 +62,47 @@ def parse_instructions(context: Context) -> Block:
         if line.startswith("--"):
             continue
 
-        command = []
         if line.startswith('\\'):
             # meta commands of psql
 
-            if line.startswith('\\c '):
+            if line.lower().startswith('\\c '):
                 # save current db
-                current_db = line.split()[1];
-        else:
-            # sql commands for postgres
+                current_db = line.split()[1]
+            elif line.lower().startswith('\\set '):
+                variable, value = line[5:].split(' ', maxsplit=1)
+                if value.strip().endswith(';'):
+                    variables[variable] = value[:-1]
+                else:
+                    variables[variable] = value
 
-            # add empty line for vivid output
-            command.append('\\echo ')
-
-            # show sql command's database name
-            command.append(f"\\echo '\\\\c {current_db}'")
-
-        command.append(line)
+                continue
 
         if current_db is None:
             # use default db when another doesn't set
             current_db = context.dbname
-            commands.append(f'\\c {context.dbname}')
+            commands.append(f'\\c {current_db}')
 
-        commands.extend(command)
+        has_semicolon = line.strip().endswith(';')
+        if has_semicolon:
+            expression.append(line[:-1])
+            commands.append(f'{" ".join(expression)};')
+            expression = []
+        else:
+            expression.append(line)
 
-    return Block(commands=tuple(commands))
+    if expression:
+        commands.append(f'{" ".join(expression)};')
+        expression = []
+
+    result = []
+    if variables:
+        for variable, value in variables.items():
+            for line in commands:
+                result.append(line.replace(f':{variable}', value))
+    else:
+        result = commands
+
+    return Block(commands=tuple(result))
 
 
 def add_suffix(suffix: str, seq: Sequence) -> List:
