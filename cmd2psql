@@ -5,165 +5,233 @@ import sys
 import os
 
 from typing import Tuple
-from typing import List
+from typing import Iterable
+from typing import Generator
+from typing import Union
 from typing import Sequence
+from typing import Optional
 
 from argparse import ArgumentParser
 from argparse import Namespace
-from itertools import chain
+
+from dataclasses import dataclass
 
 
-# ensure a script runs with a minimal version 3.6 and higher
-assert sys.version_info >= (3, 6)
+@dataclass(frozen=True)
+class Context:
+    host: str
+    port: str
+    username: str
+    dbname: str
+    instructions: str
 
 
-if sys.version_info >= (3, 8):
-    from dataclasses import dataclass
+TYPE_PSET = 0
+TYPE_DBNAME = 1
+TYPE_STATEMENT = 2
+TYPE_META = 3
+TYPE_SQL_COMMENT = 4
 
-    @dataclass(frozen=True)
-    class Context:
-        host: str
-        port: str
-        username: str
-        dbname: str
-        instructions: str
-
-    @dataclass(frozen=True)
-    class Block:
-        commands: Tuple
-
-else:
-    from collections import namedtuple
-
-    Context = namedtuple(
-        'Context',
-        'host port username dbname instructions'.split(),
-    )
-    Block = namedtuple('Block', 'commands'.split())
+KEY_EXPANDED = "expanded"
 
 
-def parse_instructions(context: Context) -> Block:
-    instructions = context.instructions
+@dataclass(frozen=True)
+class KeyValueOp:
+    typ: int
+    key: str
+    value: str
 
-    current_db = None
-    commands = [
-        # TODO: doesn't work with some meta commands e.g. \d xxx
-        # # disable autocommit for "--single-transaction"
-        # '\\set AUTOCOMMIT off',
-        # '\\echo AUTOCOMMIT: :AUTOCOMMIT',
-    ]
 
-    variables = {}
-    expression = []
-    for line in instructions.split("\n"):
+@dataclass(frozen=True)
+class ValueOp:
+    typ: int
+    value: str
+
+
+def remove_semicolon(src: str) -> str:
+    if src.endswith(";"):
+        return src[:-1]
+    return src
+
+
+def str_in_list(value: str, cnt) -> bool:
+    return any(1 for l in cnt if l.startswith(value))
+
+
+def parse_expanded_stm(line: str) -> KeyValueOp:
+    parts = line.strip().split(" ", maxsplit=1)
+    if len(parts) == 2:
+        value = remove_semicolon(parts[1].strip())
+    else:
+        value = "auto"
+    return KeyValueOp(typ=TYPE_PSET, key=KEY_EXPANDED, value=value)
+
+
+def parse_connection_stm(line: str) -> Optional[ValueOp]:
+    parts = line.strip().split(" ")
+    if len(parts) != 2:
+        return None
+    value = remove_semicolon(parts[1].strip())
+    return ValueOp(typ=TYPE_DBNAME, value=value)
+
+
+def parse_meta_command(line: str) -> ValueOp:
+    value = remove_semicolon(line)
+    return ValueOp(typ=TYPE_META, value=value)
+
+
+def parse(lines: Sequence) -> Generator[Union[ValueOp, KeyValueOp], None, None]:
+
+    sql = []
+    for line in lines:
         line = line.strip()
+
         if not line:
             continue
+        if line.startswith('#'):
+            # python comment
+            line = line[1:].strip()
+
         if line.startswith("--"):
-            continue
-
-        if line.startswith('\\'):
-            # meta commands of psql
-
-            if line.lower().startswith('\\c '):
-                # save current db
-                current_db = line.split()[1]
-            elif line.lower().startswith('\\set '):
-                variable, value = line[5:].split(' ', maxsplit=1)
-                if value.strip().endswith(';'):
-                    variables[variable] = value[:-1]
-                else:
-                    variables[variable] = value
-
-                continue
-
-        if current_db is None:
-            # use default db when another doesn't set
-            current_db = context.dbname
-            commands.append(f'\\c {current_db}')
-
-        has_semicolon = line.strip().endswith(';')
-        if has_semicolon:
-            expression.append(line[:-1])
-            commands.append(f'{" ".join(expression)};')
-            expression = []
+            # comments
+            yield ValueOp(
+                typ=TYPE_SQL_COMMENT,
+                value=line,
+            )
+        elif line.startswith("\\x"):
+            # show mode
+            if stm := parse_expanded_stm(line):
+                yield stm
+        elif line.startswith("\\c "):
+            # \c{SPACE}{DBNAME}
+            if stm := parse_connection_stm(line):
+                yield stm
+        elif line.startswith("\\"):
+            # all meta commands
+            yield parse_meta_command(line)
+        elif line.strip().endswith(";"):
+            # sql statement, can be multiline
+            sql.append(line.strip()[:-1].strip())
+            yield ValueOp(
+                typ=TYPE_STATEMENT,
+                value=" ".join(sql),
+            )
+            sql = []
         else:
-            expression.append(line)
-
-    if expression:
-        commands.append(f'{" ".join(expression)};')
-        expression = []
-
-    result = []
-    if variables:
-        for variable, value in variables.items():
-            for line in commands:
-                result.append(line.replace(f':{variable}', value))
-    else:
-        result = commands
-
-    return Block(commands=tuple(result))
+            # regular sql statements (can be multiline)
+            sql.append(line.strip())
+    if sql:
+        # statement can be multiline without `;` at the end
+        yield ValueOp(
+            typ=TYPE_STATEMENT,
+            value=" ".join(sql),
+        )
 
 
-def add_suffix(suffix: str, seq: Sequence) -> List:
-    return list(
-        chain(*([suffix, item] for item in seq))
-    )
-
-
-def execute_query(context: Context, block: Block) -> None:
-    cmd = [
-        line.encode('utf-8') for line in [
-            # postgres client
-            'psql',
-
-            # default options
-            '--no-psqlrc',
-            '--echo-queries',
-            '--no-password',
-
-            # TODO: doesn't work with some meta commands e.g. \d xxx
-            # '--single-transaction',
-
-            # connection string
-            '--host',
-            context.host,
-            '--port',
-            context.port,
-            '--username',
-            context.username,
-
-            # meta & sql commands
-            *add_suffix('-c', block.commands),
-        ]
-    ]
+def execute_process(
+    command: Sequence[str],
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    return Tuple[StdOut, Error]
+    """
 
     process = subprocess.Popen(
-        cmd,
-        stdin =subprocess.PIPE,
+        [i.encode("utf-8") for i in command],
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
 
+    timeout = 60
     try:
-        stdout, stderr = process.communicate(timeout=60)
+        stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        print('subprocess did not terminate in time')
-        exit(1)
+        print("")
+        return None, f"subprocess did not terminate in {timeout} seconds"
 
-    stderr_msg = stderr.decode('utf-8').strip()
+    stderr_msg = stderr.decode("utf-8").strip()
     if stderr_msg:
-        print(stderr_msg)
+        return None, stderr_msg
     else:
+        return stdout.decode("utf-8").strip(), None
+
+
+def execute_sql(context: Context, statements: Iterable) -> None:
+    @dataclass
+    class SQLCommand:
+        config: list
+        pset: list
+        meta: list
+        sql: list
+
+    def new_frame():
+        # TODO: doesn't work with some meta commands e.g. \d xxx
+        # '--single-transaction',
+
+        return SQLCommand(
+            config=[
+                "psql",
+                "--no-psqlrc",
+                "--echo-queries",
+                "--no-password",
+                f"--host={context.host}",
+                f"--port={context.port}",
+                f"--username={context.username}",
+            ],
+            pset=[],
+            meta=[
+                "--command=\\timing on",
+            ],
+            sql=[],
+        )
+
+    frames = [new_frame()]
+    for stm in statements:
+        frame = frames[-1]
+
+        if stm.typ == TYPE_PSET:
+            frame.pset.append(f"--pset={stm.key}={stm.value}")
+        elif stm.typ == TYPE_META:
+            frame.meta.append(f"--command={stm.value}")
+        elif stm.typ == TYPE_STATEMENT:
+            frame.sql.append(f"--command={stm.value}")
+        elif stm.typ == TYPE_SQL_COMMENT:
+            pass
+        elif stm.typ == TYPE_DBNAME:
+            if str_in_list("--dbname=", frame.config):
+                # next db connection, create new frame
+                frames.append(new_frame())
+                frame = frames[-1]
+                frame.config.append(f"--dbname={stm.value}")
+            else:
+                # first db connection, modify actual frame
+                frame.config.append(f"--dbname={stm.value}")
+
+    frame = frames[-1]
+    if not str_in_list("--dbname=", frame.config):
+        frame.config.append(f"--dbname={context.dbname}")
+
+    for frame in frames:
         print()
-        print(stdout.decode('utf-8').strip())
+        print(
+            " ".join(
+                frame.config + frame.pset + frame.meta,
+            ),
+        )
+        out, error = execute_process(
+            frame.config + frame.pset + frame.meta + frame.sql
+        )
+        if error:
+            print("ERROR", error)
+        if out:
+            print(out)
 
 
 def get_context(params: Namespace) -> Context:
     if sys.stdin.isatty():
         instructions = params.instructions
     else:
-        instructions = '\n'.join(sys.stdin.readlines())
+        instructions = "".join(sys.stdin.readlines())
 
     return Context(
         host=params.host,
@@ -177,34 +245,34 @@ def get_context(params: Namespace) -> Context:
 def get_cli_params() -> Namespace:
     default_host = "local socket"
     default_port = "5432"
-    default_user = os.environ.get('USER', 'postgres')
+    default_user = os.environ.get("USER", "postgres")
 
-    parser = ArgumentParser('util for postgesql execution', add_help=False)
+    parser = ArgumentParser("util for postgesql execution", add_help=False)
     parser.add_argument(
-        '-h',
-        '--host',
+        "-h",
+        "--host",
         type=str,
-        help='database server host or socket directory '
-             f'(default: "{default_host}")',
+        help="database server host or socket directory "
+        f'(default: "{default_host}")',
         default=default_host,
     )
     parser.add_argument(
-        '-p',
-        '--port',
+        "-p",
+        "--port",
         type=str,
         help=f'database server port (default: "{default_port}")',
         default=default_port,
     )
     parser.add_argument(
-        '-U',
-        '--username',
+        "-U",
+        "--username",
         type=str,
         help=f'database user name (default: "{default_user}")',
         default=default_user,
     )
     parser.add_argument(
-        '-d',
-        '--dbname',
+        "-d",
+        "--dbname",
         type=str,
         help=f'database name to connect to (default: "{default_user}")',
         default=default_user,
@@ -223,15 +291,120 @@ def main() -> None:
 
     context = get_context(params)
     if not context.instructions:
-        print(
-            'sql instructions must be set by '
-            'parameter "instructions" or "stdin"'
-        )
         exit(0)
 
-    block = parse_instructions(context)
-    execute_query(context, block)
+    lines = context.instructions.split("\n")
+    statements = parse(lines)
+    execute_sql(context, statements)
+
+
+def tests():
+    def test_parse_expanded_stm():
+        def check(raw_input: str, expected_result: str):
+            stm = parse_expanded_stm(raw_input)
+            assert isinstance(stm, KeyValueOp)
+            assert stm.typ == TYPE_PSET, f"stm type must be {TYPE_PSET}"
+            assert stm.key == KEY_EXPANDED, f"key must be {KEY_EXPANDED}"
+            assert (
+                stm.value == expected_result
+            ), f"input `{raw_input}` expected result `{expected_result}"
+
+        check("\\x", "auto")
+        check("\\x on", "on")
+        check("\\x off", "off")
+        check("\\x auto", "auto")
+        check("\\x on;", "on")
+        check("\\x off;", "off")
+        check("\\x auto;", "auto")
+
+    def test_parse_connection_stm():
+        def check(raw_input: str, expected_result: str):
+            stm = parse_connection_stm(raw_input)
+            assert isinstance(stm, ValueOp)
+            assert stm.typ == TYPE_DBNAME, f"stm type must be {TYPE_DBNAME}"
+            assert (
+                stm.value == expected_result
+            ), f"input `{raw_input}` expected result `{expected_result}"
+
+        stm = parse_connection_stm("\\c")
+        assert stm is None, "connection without db name must be None"
+        check("\\c dbname", "dbname")
+        check("\\c dbname;", "dbname")
+
+    def test_parse_meta_command():
+        def check(raw_input: str, expected_result: str):
+            stm = parse_meta_command(raw_input)
+            assert isinstance(stm, ValueOp)
+            assert stm.typ == TYPE_META, f"stm type must be {TYPE_META}"
+            assert (
+                stm.value == expected_result
+            ), f"input `{raw_input}` expected result `{expected_result}"
+
+        check("\\timing", "\\timing")
+        check("\\timing;", "\\timing")
+        check("\\timing on", "\\timing on")
+        check("\\timing off", "\\timing off")
+        check("\\timing on;", "\\timing on")
+        check("\\timing off;", "\\timing off")
+        check("\\conninfo", "\\conninfo")
+        check("\\conninfo;", "\\conninfo")
+
+    def test_pasre():
+        lines = [
+            '\\x on',
+            '\\c uaprom2',
+            '\\timing off',
+            'select id, name from product limit 1;',
+
+            '--\\d tag;',
+
+            '\\x off;',
+            '\\c ruprom2',
+            '  select id, status, url_alias from tag limit 1  ;',
+
+            '--\\d tag',
+
+            'explain analyze select',
+            '   id, url_alias ',
+            'from tag ',
+            'limit 1;',
+
+            '# select ',
+            '#status ',
+            '#from product where',
+            '# id = 123',
+        ]
+        stms = list(parse(lines))
+        assert stms[0].typ == TYPE_PSET
+        assert stms[0].value == 'on'
+        assert stms[1].typ == TYPE_DBNAME
+        assert stms[1].value == 'uaprom2'
+        assert stms[2].typ == TYPE_META
+        assert stms[2].value == '\\timing off'
+        assert stms[3].typ == TYPE_STATEMENT
+        assert stms[3].value == 'select id, name from product limit 1'
+        assert stms[4].typ == TYPE_SQL_COMMENT
+        assert stms[4].value == '--\\d tag;'
+        assert stms[5].typ == TYPE_PSET
+        assert stms[5].key == KEY_EXPANDED
+        assert stms[5].value == 'off'
+        assert stms[6].typ == TYPE_DBNAME
+        assert stms[6].value == 'ruprom2'
+        assert stms[7].typ == TYPE_STATEMENT
+        assert stms[7].value == 'select id, status, url_alias from tag limit 1'
+        assert stms[8].typ == TYPE_SQL_COMMENT
+        assert stms[8].value == '--\\d tag'
+        assert stms[9].typ == TYPE_STATEMENT
+        assert stms[9].value == 'explain analyze select id, url_alias from tag limit 1'
+        assert stms[10].typ == TYPE_STATEMENT
+        assert stms[10].value == 'select status from product where id = 123'
+
+    test_parse_expanded_stm()
+    test_parse_connection_stm()
+    test_parse_meta_command()
+    test_pasre()
 
 
 if __name__ == "__main__":
+    # tests()
     main()
